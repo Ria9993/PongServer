@@ -4,6 +4,9 @@ A simple multithread pong game server using TCP/UDP.
 # Preview
 ![alt text](preview-20240727-pr13.gif)
 
+# Flow
+![alt text](mt_arch.png)
+
 ## Server Build / Run
 ```bash
 $ g++ -std=c++17 -O2 Source/*.cpp -o server

@@ -2,7 +2,8 @@
 
 #define PORT 9180
 #define MAX_SESSION 1000
-#define NUM_SESSION_WORKER_THREAD 6 // Typically, twice the number of CPU cores
+#define NUM_SESSION_WORKER_THREAD 8 // Typically, twice the number of CPU cores
+// or std::min<uint32>(NUM_SESSION_WORKER_THREAD, std::thread::hardware_concurrency());
 #define CACHE_LINE 64
 #define SERVER_TICK_RATE 20 // Per Sec
 

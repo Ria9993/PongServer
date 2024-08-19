@@ -20,10 +20,10 @@ public:
     enum class PlayerID;
     enum class InputKey;
     enum class InputType;
+    enum class RoundResultType;
 
 public:
-    Session(int clientSocket, 
-            uint32_t sessionID, 
+    Session(uint32_t sessionID, 
             uint32_t fieldWidth, 
             uint32_t fieldHeight, 
             uint32_t winScore, 
@@ -48,6 +48,12 @@ public:
     inline uint32_t GetSessionID() const { return SessionID; }
     
     inline std::chrono::system_clock::time_point GetLastTickUpdateTime() const { return LastTickUpdateTime; }
+
+    inline bool IsRoundRunning() const { return bRoundRunning; }
+
+    inline RoundResultType GetRoundResult() const { return LastRoundResult; }
+
+    inline bool IsSessionEnded() const { return bSessionEnded; }
 
 public:
     // Player Input State
@@ -78,12 +84,20 @@ public:
         InputType Type;
     };
 
+public:
+    // Round Result
+    enum class RoundResultType
+    {
+        Timeout = 0,
+        WinPlayerA = 1,
+        WinPlayerB = 2
+    };
+
 private:
     uint32_t SessionID;
-    std::chrono::system_clock::time_point LastTickUpdateTime;
+    std::chrono::system_clock::time_point LastTickUpdateTime; //< Time point of started last tick processing
 
     // Parameters
-    int      ClientSocket;
     uint32_t FieldWidth;
     uint32_t FieldHeight;
     uint32_t WinScore;
@@ -112,10 +126,6 @@ private:
     InputKey PlayerB_PaddleDir;
     std::chrono::milliseconds RoundTimeElapsed;
     bool bRoundRunning;
-
-public:
-    // Thread Worker Barrier
-    alignas(CACHE_LINE)
-    std::atomic<bool> bThreadWorkerRunning;
-    char padding2[CACHE_LINE - sizeof(bThreadWorkerRunning)];
+    bool bSessionEnded;
+    RoundResultType LastRoundResult;
 };

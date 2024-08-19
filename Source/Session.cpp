@@ -1,7 +1,6 @@
 #include "Session.hpp"
 
-Session::Session(int clientSocket, 
-            uint32_t sessionID, 
+Session::Session(uint32_t sessionID, 
             uint32_t fieldWidth, 
             uint32_t fieldHeight, 
             uint32_t winScore, 
@@ -16,7 +15,6 @@ Session::Session(int clientSocket,
             uint16_t recvPort_ObjectPos_Stream)
     : SessionID(sessionID)
     , LastTickUpdateTime(std::chrono::system_clock::now())
-    , ClientSocket(clientSocket)
     , FieldWidth(fieldWidth)
     , FieldHeight(fieldHeight)
     , WinScore(winScore)
@@ -33,7 +31,7 @@ Session::Session(int clientSocket,
     , ScoreB(0)
     , RoundTimeElapsed(0)
     , bRoundRunning(false)
-    , bThreadWorkerRunning(false)
+    , bSessionEnded(false)
 {
     Addr_ObjectPos_Stream.sin_port = recvPort_ObjectPos_Stream;
 }
@@ -44,33 +42,26 @@ bool Session::BeginRound()
         return false;
     }
 
-    bool casExpected = false;
-    while (!bThreadWorkerRunning.compare_exchange_weak(casExpected, true, std::memory_order_relaxed, std::memory_order_acquire))
-    {
-    }
-    {
-        PlayerA_Input.Key = InputKey::None;
-        PlayerB_Input.Key = InputKey::None;
-        PlayerA_Input.Type = InputType::None;
-        PlayerB_Input.Type = InputType::None;
+    PlayerA_Input.Key = InputKey::None;
+    PlayerB_Input.Key = InputKey::None;
+    PlayerA_Input.Type = InputType::None;
+    PlayerB_Input.Type = InputType::None;
 
-        BallPos = { FieldWidth / 2.0f, FieldHeight / 2.0f };
-        
-        // Randomize ball direction
-        const float theta = (rand() % 360) * (3.14159265358f / 180.0f);
-        BallVel.x = cosf(theta);
-        BallVel.y = sinf(theta);
-        BallVel = vec2::normalize(BallVel) * BallSpeed;
+    BallPos = { FieldWidth / 2.0f, FieldHeight / 2.0f };
+    
+    // Randomize ball direction
+    const float theta = (rand() % 360) * (3.14159265358f / 180.0f);
+    BallVel.x = cosf(theta);
+    BallVel.y = sinf(theta);
+    BallVel = vec2::normalize(BallVel) * BallSpeed;
 
-        PlayerA_PaddlePos = 0.0f;
-        PlayerB_PaddlePos = 0.0f;
-        PlayerA_PaddleDir = InputKey::None;
-        PlayerB_PaddleDir = InputKey::None;
+    PlayerA_PaddlePos = 0.0f;
+    PlayerB_PaddlePos = 0.0f;
+    PlayerA_PaddleDir = InputKey::None;
+    PlayerB_PaddleDir = InputKey::None;
 
-        RoundTimeElapsed = std::chrono::milliseconds(0);
-        bRoundRunning = true;
-    }
-    bThreadWorkerRunning.store(false, std::memory_order_release);
+    RoundTimeElapsed = std::chrono::milliseconds(0);
+    bRoundRunning = true;
 
     return true;
 }
@@ -102,6 +93,11 @@ bool Session::Update()
     const std::chrono::system_clock::time_point nowTime = std::chrono::system_clock::now();
     const std::chrono::milliseconds deltaTime_Ms = std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - LastTickUpdateTime);
     const float deltaTime_Sec = (float)deltaTime_Ms.count() / 1000;
+
+    // Log Latency(us)
+    std::chrono::microseconds latency = std::chrono::duration_cast<std::chrono::microseconds>(nowTime - LastTickUpdateTime - tickDuration);
+    std::cout << "[DEBUG] Start work on session #" << SessionID << ". Latency: " << latency.count() << "us" << std::endl;
+                    
     
     // assert(deltaTime_Ms.count() <= tickDuration.count());
     if (deltaTime_Ms.count() > tickDuration.count()) {
@@ -117,20 +113,14 @@ bool Session::Update()
 
     RoundTimeElapsed += deltaTime_Ms;
     // Timeout 
-    if (RoundTimeElapsed >= std::chrono::milliseconds(GameTime * 1000)) {
+    if (RoundTimeElapsed >= std::chrono::milliseconds(GameTime * 1000)) 
+    {
         bRoundRunning = false;
 
-        // Response the round result
-        struct __attribute__((packed)) RoundResult
-        {
-            uint8_t Result;
-            uint32_t WinPlayer;
-        } roundResult;
+        // Set round result
+        LastRoundResult = RoundResultType::Timeout;
 
-        roundResult.Result = 0;
-        roundResult.WinPlayer = 0;
-
-        return SendFull(ClientSocket, &roundResult, sizeof(roundResult));
+        return true;
     }
 
     // Update paddle position
@@ -378,27 +368,18 @@ bool Session::Update()
                 if (i == 2 || i == 3) {
                     bRoundRunning = false;
 
-                    // Response the round result
-                    struct __attribute__((packed)) RoundResult
-                    {
-                        uint8_t Result;
-                        uint32_t WinPlayer;
-                    } roundResult;
-
-                    roundResult.Result = 0;
-
                     if (i == 2) {
                         ScoreA++;
-                        roundResult.WinPlayer = 1;
+                        LastRoundResult = RoundResultType::WinPlayerA;
                     }
                     else {
                         ScoreB++;
-                        roundResult.WinPlayer = 2;
+                        LastRoundResult = RoundResultType::WinPlayerB;
                     }
 
-                    std::cout << "[DEBUG] RoundResult: " << (int)roundResult.WinPlayer << std::endl;
+                    std::cout << "[DEBUG] RoundResult: " << (int)LastRoundResult << std::endl;
 
-                    return SendFull(ClientSocket, &roundResult, sizeof(roundResult));
+                    return true;
                 }
 
                 // Reflection
@@ -458,8 +439,14 @@ bool Session::SendObjectState()
 
     int nBytesSend = sendto(UdpSocket_ObjectPos_Stream, &objectState, sizeof(objectState), 0, (sockaddr*)&Addr_ObjectPos_Stream, sizeof(Addr_ObjectPos_Stream));
     if (nBytesSend <= 0) {
+        std::cout << "[DEBUG] sendUdpPos. sendto failed. errno: " << errno << std::endl;
         return false;
     }
+
+    std::cout << "[DEBUG] sendUdpPos. bytes: " << nBytesSend << std::endl;
+    // destination ip address and port
+    std::cout << "[DEBUG] sendUdpPos. ip: " << inet_ntoa(Addr_ObjectPos_Stream.sin_addr) << std::endl;
+    std::cout << "[DEBUG] sendUdpPos. port: " << ntohs(Addr_ObjectPos_Stream.sin_port) << std::endl;
 
     return true;
 }
