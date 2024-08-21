@@ -50,7 +50,7 @@ int main()
 
     std::condition_variable mainThreadWakeUpCondition;
     std::mutex              mainThreadWakeUpMutex;
-    std::atomic<size_t>     sessionWorkerAvailableCount(0);
+    std::atomic<int32_t>    sessionWorkerAvailableCount(0);
 
     bool                    bSessionWorkerJoinFlag = false;
 
@@ -63,24 +63,22 @@ int main()
                 TaskQueue& taskQueue = sessionWorkerTaskQueue[threadId];
 
                 // Check if task exist
-                std::unique_lock<std::mutex> cvLock(sessionWorkerWakeUpMutex);
                 {
+                    std::unique_lock<std::mutex> cvLock(sessionWorkerWakeUpMutex);
                     sessionWorkerWakeUpCondition.wait(cvLock, 
                         [&]() -> bool {
-                            return (taskQueue.Count > 0) | bSessionWorkerJoinFlag;
+                            return (sessionWorkerAvailableCount.load(std::memory_order_relaxed) > 0 && taskQueue.Count.load(std::memory_order_relaxed) > 0) | bSessionWorkerJoinFlag;
                         });
                     if (bSessionWorkerJoinFlag) {
-                        cvLock.unlock();
                         return;
                     }
                 }
-                cvLock.unlock();
 
                 // Process all tasks in the local task queue
                 while (true)
                 {
                     // Get exclusive access to session
-                    const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_acquire) - 1; // TODO: < Is it safe to use acq?
+                    const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_relaxed) - 1; 
                     if (taskIdx < 0) {
                         break;
                     }
@@ -101,11 +99,11 @@ int main()
                     {
                         // Get exclusive access to session to steal
                         TaskQueue& targetTaskQueue = sessionWorkerTaskQueue[targetThreadId];
-                        const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_acquire) - 1; // TODO: < Is it safe to use acq?
+                        const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_relaxed) - 1;
                         if (taskIdx < 0) {
                             break;
                         }
-                        Session* session = targetTaskQueue.Tasks[targetTaskQueue.Count];
+                        Session* session = targetTaskQueue.Tasks[taskIdx];
                         assert(session != nullptr);
 
                         // Update session
@@ -118,9 +116,11 @@ int main()
 
                 // Wake up main thread if all workers are completed
                 {
-                    std::unique_lock<std::mutex> cvLock(mainThreadWakeUpMutex);
-                    sessionWorkerAvailableCount -= 1;
-                    mainThreadWakeUpCondition.notify_one();
+                    const int32_t workerCount = sessionWorkerAvailableCount.fetch_sub(1, std::memory_order_release) - 1;
+                    if (workerCount == 0) {
+                        mainThreadWakeUpCondition.notify_one();
+                    }
+                    assert(workerCount < 0);
                 }
             }
         }, i); //< threadId
@@ -582,9 +582,9 @@ int main()
                         sessionOffset += numTask;
                     }
 
-                    sessionWorkerAvailableCount = NUM_SESSION_WORKER_THREAD;
+                    sessionWorkerAvailableCount.store(NUM_SESSION_WORKER_THREAD, std::memory_order_relaxed);
                 }
-                mainThreadWakeUpMutex.unlock();
+                mainThreadWakeUpMutex.unlock(); // release
 
                 // Wake up session worker
                 sessionWorkerWakeUpCondition.notify_all();
@@ -593,7 +593,7 @@ int main()
             /* -------------------------- Wait for Session Workers -------------------------- */
             {
                 std::unique_lock<std::mutex> cvLock(mainThreadWakeUpMutex);
-                mainThreadWakeUpCondition.wait(cvLock, [&]() -> bool { return sessionWorkerAvailableCount == 0; });
+                mainThreadWakeUpCondition.wait(cvLock, [&]() -> bool { return sessionWorkerAvailableCount.load(std::memory_order_relaxed) == 0; });
             }
 
             /* ------------------------------ Send Round Result ----------------------------- */
