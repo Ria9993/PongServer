@@ -80,7 +80,7 @@ int main()
                 while (true)
                 {
                     // Get exclusive access to session
-                    int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_acquire) - 1; // TODO: < Is it safe to use acq?
+                    const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_acquire) - 1; // TODO: < Is it safe to use acq?
                     if (taskIdx < 0) {
                         break;
                     }
@@ -101,7 +101,7 @@ int main()
                     {
                         // Get exclusive access to session to steal
                         TaskQueue& targetTaskQueue = sessionWorkerTaskQueue[targetThreadId];
-                        int32_t    taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_acquire) - 1; // TODO: < Is it safe to use acq?
+                        const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_acquire) - 1; // TODO: < Is it safe to use acq?
                         if (taskIdx < 0) {
                             break;
                         }
