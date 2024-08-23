@@ -1,6 +1,18 @@
 #include "Session.hpp"
 
-Session::Session(uint32_t sessionID, 
+uint32_t Session::sessionIdPoolTop = 0;
+uint32_t Session::sessionIdPool[MAX_SESSION];
+
+void Session::InitSessionIdPool() {
+    // Generate session id pool for unique session id
+    sessionIdPoolTop = MAX_SESSION;
+    uint32_t* p_sessionIdPool = (uint32_t*)sessionIdPool;
+    for (int i = MAX_SESSION - 1; i >= 0; i--) {
+        *p_sessionIdPool++ = i;
+    }
+}
+
+Session::Session(Client*  ownerClient,
             uint32_t fieldWidth, 
             uint32_t fieldHeight, 
             uint32_t winScore, 
@@ -13,8 +25,8 @@ Session::Session(uint32_t sessionID,
             int udpSocket_ObjectPos_Stream,
             sockaddr_in addr_ObjectPos_Stream,
             uint16_t recvPort_ObjectPos_Stream)
-    : SessionID(sessionID)
-    , LastTickUpdateTime(std::chrono::system_clock::now())
+    : OwnerClient(ownerClient)
+    , LastTickUpdateTime(std::chrono::steady_clock::now())
     , FieldWidth(fieldWidth)
     , FieldHeight(fieldHeight)
     , WinScore(winScore)
@@ -33,7 +45,15 @@ Session::Session(uint32_t sessionID,
     , bRoundRunning(false)
     , bSessionEnded(false)
 {
+    assert(sessionIdPoolTop != 0);
+    SessionID = Session::sessionIdPool[--Session::sessionIdPoolTop];
+
     Addr_ObjectPos_Stream.sin_port = recvPort_ObjectPos_Stream;
+}
+
+Session::~Session()
+{
+    Session::sessionIdPool[Session::sessionIdPoolTop++] = SessionID; 
 }
 
 bool Session::BeginRound()
@@ -90,22 +110,19 @@ bool Session::Update()
 {
     // Get delta time
     const std::chrono::milliseconds tickDuration(1000 / SERVER_TICK_RATE);
-    const std::chrono::system_clock::time_point nowTime = std::chrono::system_clock::now();
+    const std::chrono::steady_clock::time_point nowTime = std::chrono::steady_clock::now();
     const std::chrono::milliseconds deltaTime_Ms = std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - LastTickUpdateTime);
     const float deltaTime_Sec = (float)deltaTime_Ms.count() / 1000;
 
     // Log Latency(us)
     std::chrono::microseconds latency = std::chrono::duration_cast<std::chrono::microseconds>(nowTime - LastTickUpdateTime - tickDuration);
-    std::cout << "[DEBUG] Start work on session #" << SessionID << ". Latency: " << latency.count() << "us" << std::endl;
-                    
+    //std::cout << "[DEBUG] Start work on session #" << SessionID << ". Latency: " << latency.count() << "us. ServerTickDuration:" << std::chrono::duration_cast<std::chrono::microseconds>(tickDuration).count() << "us." << std::endl;
+    //std::cout << "[DEBUG] Lat:" << latency.count() << "us" << std::endl;             
     
     // assert(deltaTime_Ms.count() <= tickDuration.count());
-    if (deltaTime_Ms.count() > tickDuration.count()) {
-        logStream << "Session " << SessionID << " is too fast. deltaTime: " << deltaTime_Ms.count() << "ms" << std::endl;
-    }
 
     // Update last tick update time
-    LastTickUpdateTime = std::chrono::system_clock::now();
+    LastTickUpdateTime = std::chrono::steady_clock::now();
 
     if (!bRoundRunning) {
         return true;
@@ -113,7 +130,7 @@ bool Session::Update()
 
     RoundTimeElapsed += deltaTime_Ms;
     // Timeout 
-    if (RoundTimeElapsed >= std::chrono::milliseconds(GameTime * 1000)) 
+    if (RoundTimeElapsed >= std::chrono::milliseconds(GameTime * std::chrono::milliseconds(1000))) 
     {
         bRoundRunning = false;
 
@@ -377,7 +394,7 @@ bool Session::Update()
                         LastRoundResult = RoundResultType::WinPlayerB;
                     }
 
-                    std::cout << "[DEBUG] RoundResult: " << (int)LastRoundResult << std::endl;
+                    //std::cout << "[DEBUG] RoundResult: " << (int)LastRoundResult << std::endl;
 
                     return true;
                 }
@@ -443,10 +460,10 @@ bool Session::SendObjectState()
         return false;
     }
 
-    std::cout << "[DEBUG] sendUdpPos. bytes: " << nBytesSend << std::endl;
+    // std::cout << "[DEBUG] sendUdpPos. bytes: " << nBytesSend << std::endl;
     // destination ip address and port
-    std::cout << "[DEBUG] sendUdpPos. ip: " << inet_ntoa(Addr_ObjectPos_Stream.sin_addr) << std::endl;
-    std::cout << "[DEBUG] sendUdpPos. port: " << ntohs(Addr_ObjectPos_Stream.sin_port) << std::endl;
+    // std::cout << "[DEBUG] sendUdpPos. ip: " << inet_ntoa(Addr_ObjectPos_Stream.sin_addr) << std::endl;
+    // std::cout << "[DEBUG] sendUdpPos. port: " << ntohs(Addr_ObjectPos_Stream.sin_port) << std::endl;
 
     return true;
 }

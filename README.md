@@ -2,7 +2,8 @@
 A simple multithread pong game server using TCP/UDP.
 
 # Preview
-![alt text](preview-20240727-pr13.gif)
+![alt text](preview-20240727-pr13.gif)  
+[![Video Label](http://img.youtube.com/vi/hOBc6DK7bnk/0.jpg)](https://youtu.be/hOBc6DK7bnk?t=0s)  
 
 # Flow
 ![alt text](mt_arch.png)
@@ -15,7 +16,7 @@ $ ./server
 
 ## Tester Build / Run
 ```bash
-$ g++ -std=c++17 -O2 TempTestVisualizer/*.cpp -o tester
+$ g++ -std=c++17 -O2 Tester/main_visual.cpp -o tester
 $ ./tester
 ```
 

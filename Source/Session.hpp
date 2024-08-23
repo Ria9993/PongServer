@@ -10,6 +10,7 @@
 #include <arpa/inet.h> 
 #include <unistd.h>
 
+#include "Client.hpp"
 #include "math.hpp"
 #include "config.hpp"
 #include "Helper.hpp"
@@ -23,7 +24,11 @@ public:
     enum class RoundResultType;
 
 public:
-    Session(uint32_t sessionID, 
+    // Generate session id pool for unique session id
+    static void InitSessionIdPool();
+
+public:
+    Session(Client*  ownerClient,
             uint32_t fieldWidth, 
             uint32_t fieldHeight, 
             uint32_t winScore, 
@@ -37,6 +42,8 @@ public:
             sockaddr_in addr_ObjectPos_Stream,
             uint16_t recvPort_ObjectPos_Stream);
 
+    ~Session();
+
     bool BeginRound();
 
     bool SetPlayerInput(PlayerID playerID, InputKey key, InputType type);
@@ -46,8 +53,10 @@ public:
     bool SendObjectState();
 
     inline uint32_t GetSessionID() const { return SessionID; }
+
+    inline Client* GetOwnerClient() const { return OwnerClient; }
     
-    inline std::chrono::system_clock::time_point GetLastTickUpdateTime() const { return LastTickUpdateTime; }
+    inline std::chrono::steady_clock::time_point GetLastTickUpdateTime() const { return LastTickUpdateTime; }
 
     inline bool IsRoundRunning() const { return bRoundRunning; }
 
@@ -95,7 +104,8 @@ public:
 
 private:
     uint32_t SessionID;
-    std::chrono::system_clock::time_point LastTickUpdateTime; //< Time point of started last tick processing
+    Client*  OwnerClient;
+    std::chrono::steady_clock::time_point LastTickUpdateTime; //< Time point of started last tick processing
 
     // Parameters
     uint32_t FieldWidth;
@@ -128,4 +138,8 @@ private:
     bool bRoundRunning;
     bool bSessionEnded;
     RoundResultType LastRoundResult;
+
+private:
+    static uint32_t sessionIdPoolTop;
+    static uint32_t sessionIdPool[MAX_SESSION];
 };

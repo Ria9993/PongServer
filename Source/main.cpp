@@ -18,6 +18,7 @@
 #include "config.hpp"
 #include "math.h"
 #include "Helper.hpp"
+#include "Client.hpp"
 #include "Session.hpp"
 
 int main() 
@@ -42,15 +43,19 @@ int main()
         Session**            Tasks  = nullptr;
         std::atomic<int32_t> Count  = 0;
         size_t               Capacity = 0;
+
+        inline ~TaskQueue() {
+            delete Tasks;
+        }
     };
 
     std::condition_variable sessionWorkerWakeUpCondition;
     std::mutex              sessionWorkerWakeUpMutex;
     TaskQueue               sessionWorkerTaskQueue[NUM_SESSION_WORKER_THREAD];
+    std::atomic<int32_t>    sessionWorkerTotalTaskRemainingCount(0);
 
     std::condition_variable mainThreadWakeUpCondition;
     std::mutex              mainThreadWakeUpMutex;
-    std::atomic<int32_t>    sessionWorkerAvailableCount(0);
 
     bool                    bSessionWorkerJoinFlag = false;
 
@@ -67,12 +72,15 @@ int main()
                     std::unique_lock<std::mutex> cvLock(sessionWorkerWakeUpMutex);
                     sessionWorkerWakeUpCondition.wait(cvLock, 
                         [&]() -> bool {
-                            return (sessionWorkerAvailableCount.load(std::memory_order_relaxed) > 0 && taskQueue.Count.load(std::memory_order_relaxed) > 0) | bSessionWorkerJoinFlag;
+                            const int32_t localTaskCount = taskQueue.Count.load(std::memory_order_relaxed);
+                            return (localTaskCount > 0) | bSessionWorkerJoinFlag;
                         });
                     if (bSessionWorkerJoinFlag) {
                         return;
                     }
                 }
+
+                int32_t completedTaskCount = 0;
 
                 // Process all tasks in the local task queue
                 while (true)
@@ -85,11 +93,15 @@ int main()
                     Session* session = taskQueue.Tasks[taskIdx];
                     assert(session != nullptr);
 
-                    // Update session
-                    session->Update();
+                    //std::cout << "[DEBUG] thread[" << threadId << "] Begin work sesion #" << session->GetSessionID() << std::endl;
+                    {
+                        // Update session
+                        session->Update();
 
-                    // Send session state to client
-                    session->SendObjectState();
+                        // Send session state to client
+                        session->SendObjectState();
+                    }
+                    completedTaskCount += 1;
                 }
 
                 // Work stealing from other worker
@@ -99,28 +111,36 @@ int main()
                     {
                         // Get exclusive access to session to steal
                         TaskQueue& targetTaskQueue = sessionWorkerTaskQueue[targetThreadId];
-                        const int32_t taskIdx = taskQueue.Count.fetch_sub(1, std::memory_order_relaxed) - 1;
+                        const int32_t taskIdx = targetTaskQueue.Count.fetch_sub(1, std::memory_order_relaxed) - 1;
                         if (taskIdx < 0) {
                             break;
                         }
                         Session* session = targetTaskQueue.Tasks[taskIdx];
                         assert(session != nullptr);
 
-                        // Update session
-                        session->Update();
+                        //std::cout << "[DEBUG] thread[" << threadId << "] Begin work sesion #" << session->GetSessionID() << "[Steal]" << std::endl;
+                        {
+                            // Update session
+                            session->Update();
 
-                        // Send session state to client
-                        session->SendObjectState();
+                            // Send session state to client
+                            session->SendObjectState();
+                        }
+                        completedTaskCount += 1;
                     }
                 }
 
                 // Wake up main thread if all workers are completed
                 {
-                    const int32_t workerCount = sessionWorkerAvailableCount.fetch_sub(1, std::memory_order_release) - 1;
-                    if (workerCount == 0) {
+                    std::unique_lock cvLock(mainThreadWakeUpMutex);
+                    const int32_t remainTaskCount = sessionWorkerTotalTaskRemainingCount.fetch_sub(completedTaskCount, std::memory_order_release) - completedTaskCount;
+                    // std::cout << "[DEBUG] completed. remainTaskCount: " << remainTaskCount << std::endl;
+                    if (remainTaskCount == 0) {
+                        // std::cout << "[DEBUG] wake up main thread." << std::endl;
+                        cvLock.unlock();
                         mainThreadWakeUpCondition.notify_one();
                     }
-                    assert(workerCount < 0);
+                    assert(remainTaskCount >= 0);
                 }
             }
         }, i); //< threadId
@@ -137,9 +157,16 @@ int main()
     }
 
     // Set socket option to reuse address
-#ifdef __linux__
+#if defined(__linux__)
     int opt = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
+        std::cerr << "Failed to set socket option" << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+#elif defined(__APPLE__)
+    int opt = 1;
+    if (::setsockopt(serverSocket, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
         std::cerr << "Failed to set socket option" << std::endl;
         close(serverSocket);
         return 1;
@@ -179,85 +206,120 @@ int main()
     }
 
     // Register server socket to select()
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(serverSocket, &readfds);
-    int maxFd = serverSocket;
-
+    fd_set globalFdSet;
+    FD_ZERO(&globalFdSet);
+    FD_SET(serverSocket, &globalFdSet);
+    int globalFdSet_MaxFd = serverSocket;
 
     /* -------------------------------------------------------------------------- */
     /*                                 Server Loop                                */
     /* -------------------------------------------------------------------------- */
+    std::vector<Client*> clients;
+
+    Session::InitSessionIdPool();
+
     while (true)
     {
-        // Generate session id pool for unique session id
-        uint32_t sessionIdPoolTop = 0;
-        uint32_t sessionIdPool[MAX_SESSION];
-        for (int i = 0; i < MAX_SESSION; i++) {
-            sessionIdPool[i] = i;
-        }
+        fd_set recvFdSet = globalFdSet;
+        fd_set sendFdSet = globalFdSet;
 
-        // Accept client server
-        sockaddr_in clientAddress;
-        socklen_t clientAddressSize = sizeof(clientAddress);
-        if (select(maxFd + 1, &readfds, NULL, NULL, NULL) == -1) {
+        timeval zeroTimeout = { 0, };
+        if (select(globalFdSet_MaxFd + 1, &recvFdSet, &sendFdSet, NULL, &zeroTimeout) == -1) {
             std::cerr << "Failed to select" << std::endl;
             close(serverSocket);
             return 1;
         }
-        int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddress, &clientAddressSize);
-        if (clientSocket == -1) {
-            std::cerr << "Failed to accept connection" << std::endl;
-            close(serverSocket);
-            return 1;
-        }
 
-        // Intialize recv/send buffer (for partial recv/send)
-        std::vector<char> recvBuffer;
-        std::vector<char> sendBuffer;
-        recvBuffer.reserve(4096);
-        sendBuffer.reserve(4096);
-
-        while (true)
+        // Accept new clients 
+        if (FD_ISSET(serverSocket, &recvFdSet)) 
         {
-            /* ------------------- Send buffered message to the client ------------------- */
+            while (true)
             {
-                if (!sendBuffer.empty()) {
-                    const int nBytesSent = send(clientSocket, sendBuffer.data(), sendBuffer.size(), 0);
+                Client* newClient = new Client;
+                assert(newClient != nullptr);
+
+                newClient->socket = accept(serverSocket, (struct sockaddr*)&newClient->address, &newClient->addressLen);
+                if (newClient->socket == -1) {
+                    delete newClient;
+                    break;
+                }
+
+                FD_SET(newClient->socket, &globalFdSet);
+                if (globalFdSet_MaxFd < newClient->socket) {
+                    globalFdSet_MaxFd = newClient->socket;
+                }
+
+                clients.push_back(newClient);
+
+                std::cout << "[LOG] New client connectied." << std::endl;
+            }
+        }
+            
+        // Process each socket
+        for (std::vector<Client*>::iterator clientIt = clients.begin(); clientIt != clients.end();)
+        {
+            Client& client = *(*clientIt);
+
+            /* ------------------- Send buffered message to the client ------------------- */
+            if (FD_ISSET(client.socket, &sendFdSet))
+            {
+                if (!client.sendBuffer.empty()) {
+                    const int nBytesSent = send(client.socket, client.sendBuffer.data(), client.sendBuffer.size(), 0);
                     if (nBytesSent == -1) {
                         std::cout << "[DEBUG] send() == -1. errno: " << errno << std::endl;
                     }
                     else {
-                        sendBuffer.erase(sendBuffer.begin(), sendBuffer.begin() + nBytesSent);
+                        client.sendBuffer.erase(client.sendBuffer.begin(), client.sendBuffer.begin() + nBytesSent);
                     }
                 }
             }
 
             /* --------------------- Receive message from the client -------------------- */
+            if (FD_ISSET(client.socket, &recvFdSet))
             {
                 char buffer[1024];
-                const int nBytesRecv = recv(clientSocket, buffer, sizeof(buffer), 0);
+                const int nBytesRecv = recv(client.socket, buffer, sizeof(buffer), 0);
                 if (nBytesRecv == -1) {
                     std::cout << "[DEBUG] recv() == -1. errno: " << errno << std::endl;
                 }
+                // Client disconnected
                 else if (nBytesRecv == 0) {
                     std::cout << "Client disconnected" << std::endl;
-                    break;
+
+                    FD_CLR(client.socket, &globalFdSet);
+
+                    // remove sessions of the client
+                    for (std::vector<Session*>::iterator sessionIt = sessions.begin(); sessionIt != sessions.end();) {
+                        if ((*sessionIt)->GetOwnerClient() == &client) {
+                            delete *sessionIt;
+                            sessionIt = sessions.erase(sessionIt);
+                        }
+                        else {
+                            ++sessionIt;
+                        }
+                    }
+
+                    // delete client
+                    delete *clientIt;
+                    clientIt = clients.erase(clientIt);
+
+                    continue;
                 }
                 else {
-                    recvBuffer.insert(recvBuffer.end(), buffer, buffer + nBytesRecv);
+                    client.recvBuffer.insert(client.recvBuffer.end(), buffer, buffer + nBytesRecv);
                 }
             }
 
             /* ---------------------------- Handle API Query ---------------------------- */
+            if (FD_ISSET(client.socket, &recvFdSet))
             {
                 size_t recvBufferOffset = 0;
 
                 uint32_t queryID;
-                if (recvBuffer.size() < sizeof(queryID)) {
+                if (client.recvBuffer.size() < sizeof(queryID)) {
                     goto CONTINUE_HANDLE_API_QUERY;
                 }
-                memcpy(&queryID, recvBuffer.data() + recvBufferOffset, sizeof(queryID));
+                memcpy(&queryID, client.recvBuffer.data() + recvBufferOffset, sizeof(queryID));
                 recvBufferOffset += sizeof(queryID);
 
                 switch (queryID)
@@ -293,32 +355,28 @@ int main()
                     } response;
 
                     // Receive param
-                    if (recvBuffer.size() - recvBufferOffset < sizeof(param)) {
+                    if (client.recvBuffer.size() - recvBufferOffset < sizeof(param)) {
                         goto CONTINUE_HANDLE_API_QUERY;
                     }
-                    memcpy(&param, recvBuffer.data() + recvBufferOffset, sizeof(param));
+                    memcpy(&param, client.recvBuffer.data() + recvBufferOffset, sizeof(param));
                     recvBufferOffset += sizeof(param);
 
                     std::cout << "[DEBUG] CreateSession_v1: " << param.FieldWidth << ", " << param.FieldHeight << ", " << param.WinScore << ", " << param.GameTime << ", " << param.BallSpeed << ", " << param.BallRadius << ", " << param.PaddleSpeed << ", " << param.PaddleSize << ", " << param.PaddleOffsetFromWall << ", " << param.RecvPort_ObjectPos_Stream << std::endl;
 
                     if (sessions.size() == MAX_SESSION) {
-                        sendBuffer.insert(sendBuffer.end(), (char*)&fail_response, (char*)&fail_response + sizeof(fail_response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&fail_response, (char*)&fail_response + sizeof(fail_response));
                         break;
                     }
 
-                    // Create a new session with unique session ID
-                    assert (sessionIdPoolTop != MAX_SESSION);
-                    const uint32_t sessionID = sessionIdPool[sessionIdPoolTop++];
-
-                    // Open UDP socket for object position stream
-                    int udpSocket_ObjectPos_Stream = socket(AF_INET, SOCK_DGRAM, 0);
+                    // Open global UDP socket for object position stream
+                    static int udpSocket_ObjectPos_Stream = socket(AF_INET, SOCK_DGRAM, 0);
                     if (udpSocket_ObjectPos_Stream == -1) {
                         std::cerr << "Failed to create UDP socket" << std::endl;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&fail_response, (char*)&fail_response + sizeof(fail_response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&fail_response, (char*)&fail_response + sizeof(fail_response));
                         break;
                     }
 
-                    sessions.push_back(new Session(sessionID,
+                    Session* newSession = new Session(&client,
                                                     param.FieldWidth,
                                                     param.FieldHeight,
                                                     param.WinScore,
@@ -329,14 +387,17 @@ int main()
                                                     param.PaddleSize,
                                                     param.PaddleOffsetFromWall,
                                                     udpSocket_ObjectPos_Stream,
-                                                    clientAddress,
-                                                    param.RecvPort_ObjectPos_Stream));
+                                                    client.address,
+                                                    param.RecvPort_ObjectPos_Stream);
+                    assert(newSession != nullptr);
+                    sessions.push_back(newSession);
+                    client.sessions.push_back(newSession);
 
-                    std::cout << "[DEBUG] Session Created: " << sessionID << std::endl;
+                    std::cout << "[DEBUG] Session Created: " << newSession->GetSessionID() << std::endl;
 
                     response.Result = 0;
-                    response.SessionID = sessionID;
-                    sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                    response.SessionID = newSession->GetSessionID();
+                    client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                     break;
                 }
                 
@@ -355,10 +416,10 @@ int main()
                     } response;
 
                     // Receive param
-                    if (recvBuffer.size() - recvBufferOffset < sizeof(param)) {
+                    if (client.recvBuffer.size() - recvBufferOffset < sizeof(param)) {
                         goto CONTINUE_HANDLE_API_QUERY;
                     }
-                    memcpy(&param, recvBuffer.data() + recvBufferOffset, sizeof(param));
+                    memcpy(&param, client.recvBuffer.data() + recvBufferOffset, sizeof(param));
                     recvBufferOffset += sizeof(param);
 
                     std::cout << "[DEBUG] AbortSession_v1: " << param.SessionID << std::endl;
@@ -369,7 +430,7 @@ int main()
                             delete sessions[i];
                             sessions.erase(sessions.begin() + i);
                             response.Result = 0;
-                            sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                            client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                             break;
                         }
                     }
@@ -377,7 +438,7 @@ int main()
                     // Session not found
                     if (i == sessions.size()) {
                         response.Result = 1;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                     }
 
                     break;
@@ -398,10 +459,10 @@ int main()
                     } response;
 
                     // Receive param
-                    if (recvBuffer.size() - recvBufferOffset < sizeof(param)) {
+                    if (client.recvBuffer.size() - recvBufferOffset < sizeof(param)) {
                         goto CONTINUE_HANDLE_API_QUERY;
                     }
-                    memcpy(&param, recvBuffer.data() + recvBufferOffset, sizeof(param));
+                    memcpy(&param, client.recvBuffer.data() + recvBufferOffset, sizeof(param));
                     recvBufferOffset += sizeof(param);
 
                     std::cout << "[DEBUG] BeginRound_v1: " << param.SessionID << std::endl;
@@ -415,7 +476,7 @@ int main()
                             else {
                                 response.Result = 1;
                             }
-                            sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                            client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                             break;
                         }
                     }
@@ -423,7 +484,7 @@ int main()
                     // Session not found
                     if (i == sessions.size()) {
                         response.Result = 1;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                     }
                     
                     break;
@@ -447,10 +508,10 @@ int main()
                     } response;
 
                     // Receive param
-                    if (recvBuffer.size() - recvBufferOffset < sizeof(param)) {
+                    if (client.recvBuffer.size() - recvBufferOffset < sizeof(param)) {
                         goto CONTINUE_HANDLE_API_QUERY;
                     }
-                    memcpy(&param, recvBuffer.data() + recvBufferOffset, sizeof(param));
+                    memcpy(&param, client.recvBuffer.data() + recvBufferOffset, sizeof(param));
                     recvBufferOffset += sizeof(param);
 
                     std::cout << "[DEBUG] ActionPlayerInput_v1: " << param.SessionID << ", " << param.PlayerID << ", " << param.InputKey << ", " << param.InputType << std::endl;
@@ -467,7 +528,7 @@ int main()
                     // Session not found
                     if (findSessionIdx == MAX_SESSION) {
                         response.Result = 1;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                         break;
                     }
 
@@ -480,7 +541,7 @@ int main()
                     }
                     else {
                         response.Result = 1;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                         break;
                     }
 
@@ -493,7 +554,7 @@ int main()
                     }
                     else {
                         response.Result = 1;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                         break;
                     }
 
@@ -509,7 +570,7 @@ int main()
                     }
                     else {
                         response.Result = 1;
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                        client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                         break;
                     }
 
@@ -517,7 +578,7 @@ int main()
                     sessions[findSessionIdx]->SetPlayerInput(playerID, inputKey, inputType);
 
                     response.Result = 0;
-                    sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                    client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                     break;
                 }
 
@@ -533,132 +594,167 @@ int main()
                     } response;
                     response.QueryID = queryID;
                     response.Result = 1;
-                    sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                    client.sendBuffer.insert(client.sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
                     break;
                 }
                 }
 
-                recvBuffer.erase(recvBuffer.begin(), recvBuffer.begin() + recvBufferOffset);
+                client.recvBuffer.erase(client.recvBuffer.begin(), client.recvBuffer.begin() + recvBufferOffset);
             }
         CONTINUE_HANDLE_API_QUERY:
+            ++clientIt;
+        }
 
-            /* -------------------------- Begin Session Workers --------------------------- */
-            std::vector<Session*> validSessions;
+        /* -------------------------- Begin Session Workers --------------------------- */
+        static std::chrono::steady_clock::time_point lastTickTime = std::chrono::steady_clock::now();
+        std::vector<Session*> workableSessions;
+        {
+            // Check if the server tick duration time has elapsed
+            const std::chrono::milliseconds tickDuration(1000 / SERVER_TICK_RATE);
+            const std::chrono::steady_clock::time_point nowTime = std::chrono::steady_clock::now();
+            const std::chrono::milliseconds deltaTime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - lastTickTime);
+            const std::chrono::microseconds latency = std::chrono::duration_cast<std::chrono::microseconds>(nowTime - lastTickTime - tickDuration);
+            //std::cout << "deltatime : " << deltaTime_ms.count() << " tickDuration: " << tickDuration.count() << std::endl;
+            if (deltaTime_ms < tickDuration) {
+                continue;
+            }
+
+
+            // Update last tick time         
+            lastTickTime = nowTime;
+            
+            // Exclude sessions that round is not running
             {
-                // Exclude sessions that have not elapsed a server tick duration or round is not running
+                
+                for (size_t i = 0; i < sessions.size(); i++) {
+                    // if (std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - sessions[i]->GetLastTickUpdateTime()) >= tickDuration
+                    if (sessions[i]->IsRoundRunning()) {
+                        workableSessions.push_back(sessions[i]);
+                    }
+                }
+            }
+
+            // Log Latency(us)
+            std::cout << "[DEBUG] RunningSession: " << workableSessions.size() << " Lat:" << latency.count() << "us" << std::endl;
+
+            // Distribute session to session worker
+            // (The wake-up condition can only be satisfied by this main thread, therefore, omit the sessionWorkerWakeUpMutex)
+            {
+                size_t sessionOffset = 0;
+                const size_t sessionPerWorker = workableSessions.size() / NUM_SESSION_WORKER_THREAD;
+                const size_t sessionRemainder = workableSessions.size() % NUM_SESSION_WORKER_THREAD;
+                for (size_t i = 0; i < NUM_SESSION_WORKER_THREAD; i++) 
                 {
-                    const std::chrono::milliseconds tickDuration(1000 / SERVER_TICK_RATE);
-                    const std::chrono::system_clock::time_point nowTime = std::chrono::system_clock::now();
+                    TaskQueue& taskQueue = sessionWorkerTaskQueue[i];
                     
-                    for (size_t i = 0; i < sessions.size(); i++) {
-                        if (std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - sessions[i]->GetLastTickUpdateTime()) >= tickDuration
-                            && sessions[i]->IsRoundRunning()) {
-                            validSessions.push_back(sessions[i]);
-                        }
-                    }
-                }
-
-                // Distribute session to session worker
-                mainThreadWakeUpMutex.lock();
-                {
-                    size_t sessionOffset = 0;
-                    const size_t sessionPerWorker = validSessions.size() / NUM_SESSION_WORKER_THREAD;
-                    const size_t sessionRemainder = validSessions.size() % NUM_SESSION_WORKER_THREAD;
-                    for (size_t i = 0; i < NUM_SESSION_WORKER_THREAD; i++) 
-                    {
-                        TaskQueue& taskQueue = sessionWorkerTaskQueue[i];
-                        
-                        const size_t numTask = sessionPerWorker + ((i < sessionRemainder) ? 1 : 0);
-                        if (taskQueue.Capacity < numTask) {
-                            taskQueue.Capacity = numTask;
-                            delete taskQueue.Tasks;
-                            taskQueue.Tasks = new Session*[taskQueue.Capacity];
-                        }
-
-                        for (size_t j = 0; j < numTask; j++) {
-                            taskQueue.Tasks[j] = validSessions[sessionOffset + j];
-                        }
-                        taskQueue.Count = numTask;
-                        sessionOffset += numTask;
+                    const size_t numTask = sessionPerWorker + ((i < sessionRemainder) ? 1 : 0);
+                    if (taskQueue.Capacity < numTask) {
+                        taskQueue.Capacity = numTask;
+                        delete taskQueue.Tasks;
+                        taskQueue.Tasks = new Session*[taskQueue.Capacity];
                     }
 
-                    sessionWorkerAvailableCount.store(NUM_SESSION_WORKER_THREAD, std::memory_order_relaxed);
+                    for (size_t j = 0; j < numTask; j++) {
+                        taskQueue.Tasks[j] = workableSessions[sessionOffset + j];
+                    }
+                    taskQueue.Count = numTask;
+                    sessionOffset += numTask;
                 }
-                mainThreadWakeUpMutex.unlock(); // release
 
-                // Wake up session worker
+                // Print distribution
+                // std::cout << "[DEBUG] -[TaskDistribution]-" << std::endl;
+                // for (size_t i = 0; i < NUM_SESSION_WORKER_THREAD; i++) 
+                // {
+                //     TaskQueue& taskQueue = sessionWorkerTaskQueue[i];
+                //     std::cout << "[" << i << "] { ";
+                //     for (int32_t idx = 0; idx < taskQueue.Count.load(std::memory_order_relaxed); idx++) {
+                //         std::cout << taskQueue.Tasks[idx] << ", ";
+                //     }
+                //     std::cout << "}" << std::endl;
+                // }
+
+                sessionWorkerTotalTaskRemainingCount.store(workableSessions.size(), std::memory_order_release);
+            }
+
+
+            // Wake up session worker
+            if (workableSessions.size() != 0) {
+                //std::cout << "[DEBUG] begin worker. taskNum: " << sessionWorkerTotalTaskRemainingCount.load(std::memory_order_relaxed) << std::endl;
                 sessionWorkerWakeUpCondition.notify_all();
             }
-
-            /* -------------------------- Wait for Session Workers -------------------------- */
-            {
-                std::unique_lock<std::mutex> cvLock(mainThreadWakeUpMutex);
-                mainThreadWakeUpCondition.wait(cvLock, [&]() -> bool { return sessionWorkerAvailableCount.load(std::memory_order_relaxed) == 0; });
-            }
-
-            /* ------------------------------ Send Round Result ----------------------------- */
-            {
-                for (Session* session : validSessions) {
-                    if (!session->IsRoundRunning()) {
-                        struct __attribute__((packed)) RoundResult_Response
-                        {
-                            uint32_t QueryID = 201;
-                            uint32_t WinPlayer;
-                        } response;
-
-                        Session::RoundResultType roundResult = session->GetRoundResult();
-                        if (roundResult == Session::RoundResultType::Timeout) {
-                            response.WinPlayer = 0;
-                        }
-                        else if (roundResult == Session::RoundResultType::WinPlayerA) {
-                            response.WinPlayer = 1;
-                        }
-                        else if (roundResult == Session::RoundResultType::WinPlayerB) {
-                            response.WinPlayer = 2;
-                        }
-                        else {
-                            assert(false);
-                        }
-                        
-                        sendBuffer.insert(sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
-                    }
-                }
-            }
-
-            /* ------------------------------ Close Session ------------------------------- */
-            {
-                for (size_t i = 0; i < sessions.size(); i++) {
-                    if (sessions[i]->IsSessionEnded()) {
-                        delete sessions[i];
-                        sessions.erase(sessions.begin() + i);
-                    }
-                }
-            }
         }
 
-
-    CLOSE_CLIENT_CONNECTION:
-        /* ---------------------------- Cleanup Resources --------------------------- */
+        /* -------------------------- Wait for Session Workers -------------------------- */
+        if (workableSessions.size() != 0)
         {
-            // Close all session
-            for (size_t i = 0; i < MAX_SESSION; i++) {
-                delete sessions[i];
-                sessions[i] = nullptr;
-            }
-            sessions.clear();
-
-            // Close client socket
-            close(clientSocket);
+            std::unique_lock<std::mutex> cvLock(mainThreadWakeUpMutex);
+            mainThreadWakeUpCondition.wait(cvLock, [&]() -> bool {
+                //std::cout << "[DEBUG] [MainThread] WakeUp. sessionWorkerTotalTaskRemainingCount: " << sessionWorkerTotalTaskRemainingCount.load(std::memory_order_relaxed) <<  std::endl;
+                return sessionWorkerTotalTaskRemainingCount.load(std::memory_order_relaxed) == 0;
+            });
         }
+
+        /* ------------------------------ Send Round Result ----------------------------- */
+        {
+            for (Session* session : workableSessions) {
+                if (!session->IsRoundRunning()) {
+                    struct __attribute__((packed)) RoundResult_Response
+                    {
+                        uint32_t QueryID = 201;
+                        uint32_t WinPlayer;
+                    } response;
+
+                    Session::RoundResultType roundResult = session->GetRoundResult();
+                    if (roundResult == Session::RoundResultType::Timeout) {
+                        response.WinPlayer = 0;
+                    }
+                    else if (roundResult == Session::RoundResultType::WinPlayerA) {
+                        response.WinPlayer = 1;
+                    }
+                    else if (roundResult == Session::RoundResultType::WinPlayerB) {
+                        response.WinPlayer = 2;
+                    }
+                    else {
+                        assert(false);
+                    }
+                    
+                    Client* const ownerClient = session->GetOwnerClient();
+                    ownerClient->sendBuffer.insert(ownerClient->sendBuffer.end(), (char*)&response, (char*)&response + sizeof(response));
+                }
+            }
+        }
+
+        /* ------------------------------ Close Session ------------------------------- */
+        {
+            for (size_t i = 0; i < sessions.size(); i++) {
+                if (sessions[i]->IsSessionEnded()) {
+                    delete sessions[i];
+                    sessions.erase(sessions.begin() + i);
+                }
+            }
+        }
+    }
+
+
+    /* ---------------------------- Cleanup Resources --------------------------- */
+    {
+        // Close all session
+        for (size_t i = 0; i < MAX_SESSION; i++) {
+            delete sessions[i];
+            sessions[i] = nullptr;
+        }
+        sessions.clear();
+
+        // Close client socket
+        for (Client* client : clients) {
+            delete client;
+        }
+        clients.clear();
     }
 
 
     // Cleanup threads and resources
-    sessionWorkerWakeUpMutex.lock();
-    {
-        bSessionWorkerJoinFlag = true;
-    }
-    sessionWorkerWakeUpMutex.unlock();
+    std::atomic_store_explicit((std::atomic<bool>*)&bSessionWorkerJoinFlag, true, std::memory_order_release);
     sessionWorkerWakeUpCondition.notify_all();
     for (int i = 0; i < NUM_SESSION_WORKER_THREAD; i++) {
         sessionWorkerThreads[i].join();

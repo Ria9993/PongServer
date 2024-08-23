@@ -112,13 +112,13 @@ int main()
     } param;
     param.QueryID = 101;
     param.FieldWidth = 800;
-    param.FieldHeight = 600;
+    param.FieldHeight = 400;
     param.WinScore = 5;
-    param.GameTime = 300;
-    param.BallSpeed = 400;
+    param.GameTime = 20;
+    param.BallSpeed = 200;
     param.BallRadius = 30;
-    param.PaddleSpeed = 300;
-    param.PaddleSize = 300;
+    param.PaddleSpeed = 600;
+    param.PaddleSize = 200;
     param.PaddleOffsetFromWall = 100;
     sockaddr_in addr;
     socklen_t addrLen = sizeof(addr);
@@ -313,9 +313,11 @@ int main()
             struct sockaddr_in addr;
             socklen_t addrLen = sizeof(addr);
 
-            if (recvfrom(udpSocket_ObjectPos_Stream, &objectPos, sizeof(objectPos), 0, (struct sockaddr*)&addr, &addrLen) == -1) {
-                std::cerr << "Failed to receive object position stream" << std::endl;
-                break;
+            if (g_bSessionWorkerThreadRunning) {
+                if (recvfrom(udpSocket_ObjectPos_Stream, &objectPos, sizeof(objectPos), 0, (struct sockaddr*)&addr, &addrLen) == -1) {
+                    std::cerr << "Failed to receive object position stream" << std::endl;
+                    break;
+                }
             }
 
             std::cout << objectPos.BallX << ", " << objectPos.BallY << std::endl;
@@ -325,7 +327,7 @@ int main()
             const int visualWidth = 80;
             const int visualHeight = 20;
             int visualBallX = objectPos.BallX / 800.0f * visualWidth;
-            int visualBallY = objectPos.BallY / 600.0f * visualHeight;
+            int visualBallY = objectPos.BallY / 400.0f * visualHeight;
 
             char visualMap[visualHeight + 2][visualWidth + 2]; 
             memset(visualMap, ' ', sizeof(visualMap));
@@ -364,9 +366,9 @@ int main()
             paddleB_AbsPos.x = paddleB_BaseAbsPos.x;
             paddleB_AbsPos.y = paddleB_BaseAbsPos.y + objectPos.PaddleB;
             
-            vec2 visualPaddleA = { paddleA_AbsPos.x / 800.0f * visualWidth, paddleA_AbsPos.y / 600.0f * visualHeight };
-            vec2 visualPaddleB = { paddleB_AbsPos.x / 800.0f * visualWidth, paddleB_AbsPos.y / 600.0f * visualHeight };
-            int visualPaddleSize = param.PaddleSize / 600.0f * visualHeight;
+            vec2 visualPaddleA = { paddleA_AbsPos.x / 800.0f * visualWidth, paddleA_AbsPos.y / 400.0f * visualHeight };
+            vec2 visualPaddleB = { paddleB_AbsPos.x / 800.0f * visualWidth, paddleB_AbsPos.y / 400.0f * visualHeight };
+            int visualPaddleSize = param.PaddleSize / 400.0f * visualHeight;
 
             for (int y = 0; y < visualPaddleSize; ++y) {
                 visualMap[(int)visualPaddleA.y + y - (visualPaddleSize / 2)][(int)visualPaddleA.x] = 'A';
@@ -417,6 +419,7 @@ int main()
         std::cout << "Round ended, winner: " << response3.WinPlayer << std::endl;
 
         g_bSessionWorkerThreadRunning = false;
+        exit(0);
         break;
     }
     sessionWorkerThread.join();
