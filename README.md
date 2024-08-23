@@ -3,7 +3,8 @@ A simple multithread pong game server using TCP/UDP.
 
 # Preview
 ![alt text](preview-20240727-pr13.gif)  
-[![Video Label](http://img.youtube.com/vi/hOBc6DK7bnk/0.jpg)](https://youtu.be/hOBc6DK7bnk?t=0s)  
+
+https://github.com/user-attachments/assets/74eb5796-8266-4e4b-9643-7edee7afee7b  
 
 # Flow
 ![alt text](mt_arch.png)
